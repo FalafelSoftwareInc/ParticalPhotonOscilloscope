@@ -1,0 +1,166 @@
+﻿#define BUFFER_SIZE 500
+#define ANALOGPIN A0
+#define PORT 8007
+#define UNKNOWNSIGNALWIDTH 16000
+
+TCPClient client;
+TCPServer server = TCPServer(PORT);
+char myIpAddress[24];
+int16_t dataArray[BUFFER_SIZE];
+int TSArray[BUFFER_SIZE];
+int average = 0;
+int minv = 4096;
+int maxv = 0;
+int sampleDelay = 500;
+int offsetCrossingIndexs[2] = {0,0};
+int offsetCrossings[2] = {0,0};
+
+void setup() {
+    IPAddress myIp = WiFi.localIP();
+    sprintf(myIpAddress, "%d.%d.%d.%d", myIp[0], myIp[1], myIp[2], myIp[3]);
+    Particle.publish("IP",myIpAddress);
+    delay(1000);
+
+    server.begin();
+}
+
+void loop() {
+    
+    unsigned long startMSTS = micros();
+    for(int i = 0; i < arraySize(dataArray); i += 1)
+    {
+        dataArray[i] = analogRead(ANALOGPIN);
+        TSArray[i] = micros() - startMSTS;
+    }
+    
+    //Check to see if the micros() overflowed during the sample. If so, try again
+    if (TSArray[0] > TSArray[arraySize(dataArray)-1]){
+        return;
+    }
+    
+    processStats();
+    normalizeDataToAverage();
+   
+    if (!processOffsetCrossings())
+    {
+        //A clean signal has not been found. 
+        Particle.publish("Signal","Unknown");
+        offsetCrossingIndexs[0] = 0;
+        offsetCrossings[0] = TSArray[0];
+        bool unknownSignalFound = false;
+        //See if there is at least UNKNOWNSIGNALWIDTH microsecs worth of signal
+        for(int i = 1; i < arraySize(dataArray); i += 1)
+        {
+            if ((TSArray[i] - TSArray[0]) > UNKNOWNSIGNALWIDTH){
+                offsetCrossingIndexs[1] = i;
+                offsetCrossings[1] = TSArray[i];
+                unknownSignalFound = true;
+                Particle.publish("Signal",String(TSArray[i]));
+                break;
+            }
+        }
+        if (!unknownSignalFound) {
+            delay(1000);
+            Particle.publish("Signal","Error");
+            return;
+        }
+    }
+
+    TCPClient check = server.available();
+    if (check.connected())
+    {
+        client = check;
+        Particle.publish("Server","Connected");
+    }
+    if (client.connected())
+    {
+        write_socket(client, dataArray);
+    }
+
+    delay(sampleDelay);
+}
+
+void write_socket(TCPClient socket, int16_t *buffer) 
+{
+    int tcpIdx = 0;
+    uint8_t tcpBuffer[BUFFER_SIZE*2];
+
+	//First int is the trigger offset index
+    tcpBuffer[tcpIdx] = offsetCrossingIndexs[0] & 0xff;
+    tcpBuffer[tcpIdx+1] = (offsetCrossingIndexs[0] >> 8);
+    tcpIdx += 2;
+	//Second int is the microseconds per sample
+    int samplerate = (offsetCrossings[1] - offsetCrossings[0]) / (offsetCrossingIndexs[1] - offsetCrossingIndexs[0]);
+    tcpBuffer[tcpIdx] = samplerate & 0xff;
+    tcpBuffer[tcpIdx+1] = (samplerate >> 8);
+    tcpIdx += 2;
+    //The rest of ints is the data array
+    for(int i = 0; i < arraySize(dataArray); i += 1)
+    {
+        tcpBuffer[tcpIdx] = buffer[i] & 0xff;
+        tcpBuffer[tcpIdx+1] = (buffer[i] >> 8);
+        tcpIdx += 2;
+    }
+    socket.flush();
+    socket.write(tcpBuffer, tcpIdx);
+    //Particle.publish("Written",String(tcpIdx));
+}
+
+void processStats()
+{
+    minv = 4096;
+    maxv = 0;
+    average = 0;
+	float sum = 0;
+    for(int i = 0; i < arraySize(dataArray); i += 1)
+    {
+        sum += dataArray[i];
+        if (dataArray[i] < minv){
+            minv = dataArray[i];
+        }
+        if (dataArray[i] > maxv){
+            maxv = dataArray[i];
+        }
+    }
+    average = sum / arraySize(dataArray);
+    minv = minv - average;
+    maxv = maxv - average;
+}
+
+void normalizeDataToAverage()
+{
+    for(int i = 0; i < arraySize(dataArray); i += 1)
+    {
+        dataArray[i] = dataArray[i] - average;
+    }
+}
+
+bool processOffsetCrossings()
+{
+    offsetCrossingIndexs[0] = 0;
+    offsetCrossingIndexs[1] = 0;
+    offsetCrossings[0] = 0;
+    offsetCrossings[1] = 0;
+    bool crossSet = false;
+    bool fullCycle = false;
+    int crossingIndex = 0;
+    int triggerValue = maxv * 0.5;
+
+    for(int i = 0; i < arraySize(dataArray); i += 1)
+    {
+        if (crossingIndex > 1){
+            fullCycle = true;
+            break;
+        }   
+        if (!crossSet && dataArray[i] > triggerValue){
+            crossSet = true;
+        }
+        if (crossSet && dataArray[i] < triggerValue){
+            offsetCrossingIndexs[crossingIndex] = i;
+            offsetCrossings[crossingIndex] = TSArray[i];
+            ++crossingIndex;
+            crossSet = false;
+        }
+    }
+    return fullCycle;
+}
